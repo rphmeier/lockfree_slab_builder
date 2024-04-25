@@ -7,7 +7,7 @@ use rand::prelude::*;
 use dashmap::DashMap;
 
 const N_THREADS: usize = 16;
-const OPS: usize = 100_000;
+const OPS: usize = 200_000;
 const MIX_READS_PER_WRITE: usize = 4;
 const VAL_SIZE: usize = 2048;
 
@@ -24,7 +24,7 @@ fn main() {
         }
 
         for thread in threads {
-            thread.join();
+            thread.join().unwrap();
         }
 
         println!("append_only write: {}us", t.elapsed().as_micros());
@@ -40,7 +40,7 @@ fn main() {
         }
 
         for thread in threads {
-            thread.join();
+            thread.join().unwrap();
         }
 
         println!("mutex vec write: {}us", t.elapsed().as_micros());
@@ -56,7 +56,7 @@ fn main() {
         }
 
         for thread in threads {
-            thread.join();
+            thread.join().unwrap();
         }
 
         println!("dashmap write: {}us", t.elapsed().as_micros());
@@ -74,7 +74,7 @@ fn main() {
         }
 
         for thread in threads {
-            thread.join();
+            thread.join().unwrap();
         }
 
         println!("append_only mixed: {}us", t.elapsed().as_micros());
@@ -90,7 +90,7 @@ fn main() {
         }
 
         for thread in threads {
-            thread.join();
+            thread.join().unwrap();
         }
 
         println!("mutex vec mixed: {}us", t.elapsed().as_micros());
@@ -106,7 +106,7 @@ fn main() {
         }
 
         for thread in threads {
-            thread.join();
+            thread.join().unwrap();
         }
 
         println!("rwlock vec mixed: {}us", t.elapsed().as_micros());
@@ -122,7 +122,7 @@ fn main() {
         }
 
         for thread in threads {
-            thread.join();
+            thread.join().unwrap();
         }
 
         println!("dashmap mixed: {}us", t.elapsed().as_micros());
