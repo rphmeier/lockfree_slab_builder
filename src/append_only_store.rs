@@ -77,11 +77,14 @@ impl<T> AppendOnlyStore<T> {
                 
                 if compare_exchange_result.is_err() {
                     // deallocate the array
-                    // SAFETY: just allocated.
+                    // SAFETY: just allocated, was not written anywhere.
                     unsafe { std::alloc::dealloc(slice_ptr as *mut u8, layout) }
                     
                     continue
                 }
+
+                // TODO is this needed? it's meant to ensure `get` reads accurately.
+                std::sync::atomic::fence(Ordering::Release); 
                 
                 // SAFETY: all threads only increment len at this size when
                 // they successfully allocated.
@@ -106,10 +109,15 @@ impl<T> AppendOnlyStore<T> {
                 
                 return len;
             } else {
+                // TODO is this needed?
+                // It's meant to ensure `get` reads accurately.
+                std::sync::atomic::fence(Ordering::Release); 
+
+                // SAFETY: Acquire prevents pointer write being reordered.
                 let compare_exchange_result = self.len.compare_exchange(
                     len,
                     len + 1,
-                    Ordering::AcqRel,
+                    Ordering::Acquire,
                     Ordering::Relaxed,
                 );
                 
@@ -132,6 +140,10 @@ impl<T> AppendOnlyStore<T> {
 
     pub fn get(&self, index: usize) -> &T {
         let len = self.len.load(Ordering::Relaxed);
+
+        // TODO: is this needed? supposed to ensure read after push is accurate.
+        std::sync::atomic::fence(Ordering::Acquire);
+
         assert!(index < len, "index {} out of bounds", {index});
         let shard_info = shard_info(index, self.base_size);
 
