@@ -86,10 +86,17 @@ impl<T> AppendOnlyStore<T> {
                 // SAFETY: all threads only increment len at this size when
                 // they successfully allocated.
                 //
+                // Acquire prevents reordering with the subsequent write.
                 // Release prevents reordering with the previous compare-exchange
-                self.len.store(len + 1, Ordering::Release);
-            
-                // TODO fence here?
+                //
+                // UNWRAP: we already observed "len" on this thread and no other thread
+                // will win the shard compare exchange to increment.
+                self.len.compare_exchange(
+                    len,
+                    len + 1,
+                    Ordering::AcqRel,
+                    Ordering::Relaxed,
+                ).unwrap();
                 
                 unsafe {
                     // SAFETY: just claimed ownership of the item with
