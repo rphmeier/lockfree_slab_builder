@@ -1,6 +1,36 @@
-use std::alloc::Layout;
-use std::cell::UnsafeCell;
+#[cfg(not(loom))]
+use loom_compat_unsafecell::UnsafeCell;
+#[cfg(not(loom))]
+use std::alloc::{alloc, dealloc, Layout};
+#[cfg(not(loom))]
 use std::sync::atomic::{AtomicUsize, Ordering};
+
+#[cfg(loom)]
+use loom::alloc::{alloc, dealloc, Layout};
+#[cfg(loom)]
+use loom::cell::UnsafeCell;
+#[cfg(loom)]
+use loom::sync::atomic::{AtomicUsize, Ordering};
+
+#[cfg(not(loom))]
+mod loom_compat_unsafecell {
+    #[derive(Debug)]
+    pub(crate) struct UnsafeCell<T>(std::cell::UnsafeCell<T>);
+
+    impl<T> UnsafeCell<T> {
+        pub(crate) fn new(data: T) -> UnsafeCell<T> {
+            UnsafeCell(std::cell::UnsafeCell::new(data))
+        }
+
+        pub(crate) fn with<R>(&self, f: impl FnOnce(*const T) -> R) -> R {
+            f(self.0.get())
+        }
+
+        pub(crate) fn with_mut<R>(&self, f: impl FnOnce(*mut T) -> R) -> R {
+            f(self.0.get())
+        }
+    }
+}
 
 pub struct AppendOnlyStore<T> {
     claimed: AtomicUsize,
@@ -24,7 +54,7 @@ impl<T> AppendOnlyStore<T> {
             let layout = Layout::array::<UnsafeCell<T>>(base_size).unwrap();
 
             // SAFETY: allocated with correct layout.
-            unsafe { std::alloc::alloc(layout) as *mut UnsafeCell<T> }
+            unsafe { alloc(layout) as *mut UnsafeCell<T> }
         };
 
         let shards = [
@@ -71,11 +101,13 @@ impl<T> AppendOnlyStore<T> {
                     Layout::array::<UnsafeCell<T>>(self.base_size << shard_info.shard_index)
                         .unwrap();
                 // SAFETY: allocated with the correct layout.
-                let shard_ptr = unsafe { std::alloc::alloc(layout) as *mut UnsafeCell<T> };
+                let shard_ptr = unsafe { alloc(layout) as *mut UnsafeCell<T> };
                 // SAFETY: `claimed` is atomic and only this value writes to this shard.
-                unsafe {
-                    *self.shards[shard_info.shard_index].get() = shard_ptr;
-                }
+                self.shards[shard_info.shard_index].with_mut(
+                    |ptr: *mut *mut UnsafeCell<T>| unsafe {
+                        std::ptr::write(ptr, shard_ptr);
+                    },
+                );
 
                 loop {
                     // SAFETY: release ordering prevents reordering with the write to self.shards.
@@ -101,14 +133,17 @@ impl<T> AppendOnlyStore<T> {
                 while shard_info.shard_index != 0
                     && self.shards_allocated.load(Ordering::Acquire) < shard_info.shard_index
                 {
+                    #[cfg(loom)]
+                    loom::thread::yield_now();
                 }
 
                 // SAFETY: shard buffer is guaranteed to be allocated at this point and claims
                 //         are unique.
-                unsafe {
-                    (*self.shards[shard_info.shard_index].get())
-                        .offset(shard_info.sub_index as isize)
-                }
+                self.shards[shard_info.shard_index].with(
+                    |shard: *const *mut UnsafeCell<T>| unsafe {
+                        (*shard).offset(shard_info.sub_index as isize)
+                    },
+                )
             }
         };
 
@@ -136,15 +171,14 @@ impl<T> AppendOnlyStore<T> {
 
         let shard_info = shard_info(index, self.base_size);
 
-        unsafe {
-            // SAFETY: Acquire load above pairs with the release of self.writes in `push`,
-            //         which always follows writing to the shard pointer. And by the contract
-            //         of this function, `index` must have been returned from `push` _after_
-            //         that release. qed
-            let shard_ptr = *self.shards[shard_info.shard_index].get();
-            let item_ptr: *mut UnsafeCell<T> = shard_ptr.offset(shard_info.sub_index as isize);
-            &*(*item_ptr).get()
-        }
+        // SAFETY: Acquire load above pairs with the release of self.writes in `push`,
+        //         which always follows writing to the shard pointer. And by the contract
+        //         of this function, `index` must have been returned from `push` _after_
+        //         that release. qed
+        self.shards[shard_info.shard_index].with(|shard: *const *mut UnsafeCell<T>| unsafe {
+            let item_ptr: *mut UnsafeCell<T> = (*shard).offset(shard_info.sub_index as isize);
+            (*item_ptr).with(|inner: *const T| &*inner)
+        })
     }
 }
 
@@ -169,7 +203,7 @@ impl<T> Drop for AppendOnlyStore<T> {
             // SAFETY: we only increment len after allocating and writing the
             // array pointer.
             let layout = std::alloc::Layout::array::<UnsafeCell<T>>(size).unwrap();
-            std::alloc::dealloc(ptr as *mut u8, layout);
+            dealloc(ptr as *mut u8, layout);
         };
 
         // there are 0 or more full shards and 0 or 1 partially full shards
@@ -179,15 +213,17 @@ impl<T> Drop for AppendOnlyStore<T> {
 
             // SAFETY: protected by synchronization with self.writes and mutable
             // access to self.
-            let shard_ptr = unsafe { *self.shards[full_shard].get() };
-            drop_and_deallocate_nonempty(shard_ptr, shard_size, shard_size);
+            self.shards[full_shard].with_mut(|shard: *mut *mut UnsafeCell<T>| unsafe {
+                drop_and_deallocate_nonempty(*shard, shard_size, shard_size)
+            });
         }
 
         // SAFETY: sub_index of zero means unallocated and unpopulated.
         if shard_info.sub_index != 0 {
             let shard_size = (1 << shard_info.shard_index) * self.base_size;
-            let shard_ptr = unsafe { *self.shards[shard_info.shard_index].get() };
-            drop_and_deallocate_nonempty(shard_ptr, shard_size, shard_info.sub_index);
+            self.shards[shard_info.shard_index].with_mut(|shard: *mut *mut UnsafeCell<T>| unsafe {
+                drop_and_deallocate_nonempty(*shard, shard_size, shard_info.sub_index)
+            });
         }
     }
 }

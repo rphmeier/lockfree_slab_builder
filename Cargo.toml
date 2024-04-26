@@ -10,3 +10,6 @@ parking_lot = "0.12.1"
 rand = "0.8.5"
 dashmap = "5.5.3"
 blake3 = "1.5.1"
+
+[target.'cfg(loom)'.dependencies]
+loom = "0.7.2"
