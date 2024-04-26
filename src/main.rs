@@ -1,10 +1,10 @@
 mod append_only_store;
 
 use append_only_store::AppendOnlyStore;
-use std::sync::Arc;
+use dashmap::DashMap;
 use parking_lot::{Mutex, RwLock};
 use rand::prelude::*;
-use dashmap::DashMap;
+use std::sync::Arc;
 
 const N_THREADS: usize = 16;
 const OPS: usize = 200_000;
@@ -59,10 +59,14 @@ fn main() {
             thread.join().unwrap();
         }
 
-        println!("dashmap write: {}us, len={}", t.elapsed().as_micros(), map.len());
+        println!(
+            "dashmap write: {}us, len={}",
+            t.elapsed().as_micros(),
+            map.len()
+        );
     }
 
-    // MIXED 
+    // MIXED
     {
         let t = std::time::Instant::now();
         let store = Arc::new(AppendOnlyStore::new(10_000));
@@ -201,7 +205,7 @@ fn rwlock_vec_mixed(vec: Arc<RwLock<Vec<[u8; VAL_SIZE]>>>) {
 
 fn dashmap_mixed(t_id: usize, map: Arc<DashMap<(usize, usize), [u8; VAL_SIZE]>>) {
     let mut max = 0;
-    
+
     let mut total_nanos = 0u64;
 
     for op in 0..OPS {

@@ -1,6 +1,6 @@
-use std::cell::UnsafeCell;
-use std::sync::atomic::{self, AtomicUsize, AtomicPtr, Ordering};
 use std::alloc::Layout;
+use std::cell::UnsafeCell;
+use std::sync::atomic::{self, AtomicPtr, AtomicUsize, Ordering};
 
 pub struct AppendOnlyStore<T> {
     claimed: AtomicUsize,
@@ -15,18 +15,18 @@ impl<T> AppendOnlyStore<T> {
     pub fn new(base_size: usize) -> Self {
         assert!(std::mem::size_of::<T>() != 0, "not suitable for ZSTs");
         assert!(base_size > 0, "base size == 0");
-        
+
         let max_capacity = ((1usize << 16) - 1)
             .checked_mul(base_size)
             .expect("max capacity overflow");
-        
+
         let first_slice = {
             let layout = Layout::array::<T>(base_size).unwrap();
-            
+
             // SAFETY: allocated with correct layout.
             unsafe { std::alloc::alloc(layout) as *mut T }
         };
-        
+
         let shards = [
             UnsafeCell::new(first_slice),
             UnsafeCell::new(std::ptr::null_mut()),
@@ -45,7 +45,7 @@ impl<T> AppendOnlyStore<T> {
             UnsafeCell::new(std::ptr::null_mut()),
             UnsafeCell::new(std::ptr::null_mut()),
         ];
-        
+
         AppendOnlyStore {
             claimed: AtomicUsize::new(0),
             writes: AtomicUsize::new(0),
@@ -55,7 +55,7 @@ impl<T> AppendOnlyStore<T> {
             base_size,
         }
     }
-    
+
     pub fn push(&self, item: T) -> usize {
         // 1. claim a new position. this may be in unallocated space.
         let claimed = self.claimed.fetch_add(1, Ordering::Relaxed);
@@ -77,13 +77,17 @@ impl<T> AppendOnlyStore<T> {
 
                 loop {
                     // SAFETY: release ordering prevents reordering with the write to self.shards.
-                    if self.shards_allocated.compare_exchange(
-                        shard_info.shard_index - 1,
-                        shard_info.shard_index,
-                        Ordering::Release,
-                        Ordering::Relaxed,
-                    ).is_ok() {
-                        break
+                    if self
+                        .shards_allocated
+                        .compare_exchange(
+                            shard_info.shard_index - 1,
+                            shard_info.shard_index,
+                            Ordering::Release,
+                            Ordering::Relaxed,
+                        )
+                        .is_ok()
+                    {
+                        break;
                     }
                 }
 
@@ -92,12 +96,16 @@ impl<T> AppendOnlyStore<T> {
                 // spin until allocation has completed.
                 // SAFETY: Acquire ordering prevents reordering and pairs with the release, so the write to
                 //         self.shards[shard_index] is seen.
-                while shard_info.shard_index != 0 && self.shards_allocated.load(Ordering::Acquire) < shard_info.shard_index {}
+                while shard_info.shard_index != 0
+                    && self.shards_allocated.load(Ordering::Acquire) < shard_info.shard_index
+                {
+                }
 
                 // SAFETY: shard buffer is guaranteed to be allocated at this point and claims
                 //         are unique.
                 unsafe {
-                    (*self.shards[shard_info.shard_index].get()).offset(shard_info.sub_index as isize)
+                    (*self.shards[shard_info.shard_index].get())
+                        .offset(shard_info.sub_index as isize)
                 }
             }
         };
@@ -127,7 +135,7 @@ impl<T> AppendOnlyStore<T> {
         let shard_info = shard_info(index, self.base_size);
 
         unsafe {
-            // SAFETY: Acquire load above pairs with the release of self.writes in `push`, 
+            // SAFETY: Acquire load above pairs with the release of self.writes in `push`,
             //         which always follows writing to the shard pointer. And by the contract
             //         of this function, `index` must have been returned from `push` _after_
             //         that release. qed
@@ -146,7 +154,7 @@ impl<T> Drop for AppendOnlyStore<T> {
         let _writes = self.writes.load(Ordering::Acquire);
         let claimed = self.claimed.load(Ordering::Relaxed);
         let shard_info = shard_info(claimed, self.base_size);
-        
+
         let drop_and_deallocate_nonempty = |ptr: *mut T, len, size| unsafe {
             {
                 // SAFETY: len is only ever incremented immediately prior to
@@ -155,13 +163,13 @@ impl<T> Drop for AppendOnlyStore<T> {
                 let slice = std::slice::from_raw_parts_mut(ptr, len);
                 std::ptr::drop_in_place(slice as *mut [T]);
             }
-            
+
             // SAFETY: we only increment len after allocating and writing the
-            // array pointer. 
+            // array pointer.
             let layout = std::alloc::Layout::array::<T>(size).unwrap();
             std::alloc::dealloc(ptr as *mut u8, layout);
         };
-        
+
         // there are 0 or more full shards and 0 or 1 partially full shards
         // drop all the data in all of the shards.
         for full_shard in 0..shard_info.shard_index.saturating_sub(1) {
@@ -172,7 +180,7 @@ impl<T> Drop for AppendOnlyStore<T> {
             let shard_ptr = unsafe { *self.shards[full_shard].get() };
             drop_and_deallocate_nonempty(shard_ptr, shard_size, shard_size);
         }
-        
+
         // SAFETY: sub_index of zero means unallocated and unpopulated.
         if shard_info.sub_index != 0 {
             let shard_size = (1 << shard_info.shard_index) * self.base_size;
@@ -180,7 +188,7 @@ impl<T> Drop for AppendOnlyStore<T> {
             drop_and_deallocate_nonempty(shard_ptr, shard_size, shard_info.sub_index);
         }
     }
-} 
+}
 
 // SAFETY: values may be read from any thread and dropped in (and therefore sent to) any thread.
 unsafe impl<T: Send + Sync> Send for AppendOnlyStore<T> {}
@@ -202,7 +210,7 @@ impl ShardInfo {
 
 fn shard_info(len: usize, base_size: usize) -> ShardInfo {
     // shard index i stores base_size * 2^i items
-    
+
     // shard 1 can have 1 or 2 normalized
     // shard 2 can have 3, 4, 5, or 6 normalized
 
@@ -228,11 +236,12 @@ fn shard_info(len: usize, base_size: usize) -> ShardInfo {
     // so on
     let base_multiples = len / base_size;
     let remainder = len % base_size;
-    
-    
+
     let shard_index = usize::BITS as usize - (base_multiples + 1).leading_zeros() as usize - 1;
-    
-    let remaining_base_multiples = if shard_index == 0 { 0 } else {
+
+    let remaining_base_multiples = if shard_index == 0 {
+        0
+    } else {
         base_multiples.saturating_sub((1 << shard_index) - 1)
     };
     ShardInfo {
@@ -243,20 +252,48 @@ fn shard_info(len: usize, base_size: usize) -> ShardInfo {
 
 #[test]
 fn shard_info_works() {
-    assert_eq!(shard_info(0, 10), ShardInfo { shard_index: 0, sub_index: 0 });
-    assert_eq!(shard_info(9, 10), ShardInfo { shard_index: 0, sub_index: 9 });
-    
-    assert_eq!(shard_info(10, 10), ShardInfo { shard_index: 1, sub_index: 0 });
-    assert_eq!(shard_info(20, 10), ShardInfo { shard_index: 1, sub_index: 10 });
-    assert_eq!(shard_info(29, 10), ShardInfo { shard_index: 1, sub_index: 19 });
-    
-    assert_eq!(shard_info(30, 10), ShardInfo { shard_index: 2, sub_index: 0 });
+    assert_eq!(
+        shard_info(0, 10),
+        ShardInfo {
+            shard_index: 0,
+            sub_index: 0
+        }
+    );
+    assert_eq!(
+        shard_info(9, 10),
+        ShardInfo {
+            shard_index: 0,
+            sub_index: 9
+        }
+    );
+
+    assert_eq!(
+        shard_info(10, 10),
+        ShardInfo {
+            shard_index: 1,
+            sub_index: 0
+        }
+    );
+    assert_eq!(
+        shard_info(20, 10),
+        ShardInfo {
+            shard_index: 1,
+            sub_index: 10
+        }
+    );
+    assert_eq!(
+        shard_info(29, 10),
+        ShardInfo {
+            shard_index: 1,
+            sub_index: 19
+        }
+    );
+
+    assert_eq!(
+        shard_info(30, 10),
+        ShardInfo {
+            shard_index: 2,
+            sub_index: 0
+        }
+    );
 }
-
-
-
-
-
-
-
-
