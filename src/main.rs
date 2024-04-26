@@ -158,7 +158,6 @@ fn dashmap_write_heavy(t_id: usize, map: Arc<DashMap<(usize, usize), [u8; VAL_SI
 fn append_only_mixed(store: Arc<AppendOnlyStore<[u8; VAL_SIZE]>>) {
     let mut thread_indices = Vec::with_capacity(OPS);
 
-    let t = std::time::Instant::now();
     for op in 0..OPS {
         if !thread_indices.is_empty() && mix_read(op) {
             let idx = rand::thread_rng().gen_range(0..thread_indices.len());
@@ -168,7 +167,6 @@ fn append_only_mixed(store: Arc<AppendOnlyStore<[u8; VAL_SIZE]>>) {
             thread_indices.push(store.push(value(op)));
         }
     }
-    println!("  elapsed {}us", t.elapsed().as_micros());
 }
 
 fn mutex_vec_mixed(vec: Arc<Mutex<Vec<[u8; VAL_SIZE]>>>) {
@@ -205,7 +203,6 @@ fn dashmap_mixed(t_id: usize, map: Arc<DashMap<(usize, usize), [u8; VAL_SIZE]>>)
     let mut max = 0;
     
     let mut total_nanos = 0u64;
-    let t = std::time::Instant::now();
 
     for op in 0..OPS {
         if max > 0 && mix_read(op) {
@@ -222,7 +219,6 @@ fn dashmap_mixed(t_id: usize, map: Arc<DashMap<(usize, usize), [u8; VAL_SIZE]>>)
             max += 1;
         }
     }
-    println!("  elapsed t_id={t_id}, {}us", t.elapsed().as_micros());
 }
 
 fn mix_read(i: usize) -> bool {
