@@ -1,11 +1,14 @@
-use std::sync::atomic::{AtomicUsize, AtomicPtr, Ordering};
+use std::cell::UnsafeCell;
+use std::sync::atomic::{self, AtomicUsize, AtomicPtr, Ordering};
 use std::alloc::Layout;
 
 pub struct AppendOnlyStore<T> {
-    len: AtomicUsize,
+    claimed: AtomicUsize,
+    writes: AtomicUsize,
+    shards_allocated: AtomicUsize,
     max_capacity: usize,
     base_size: usize,
-    shards: [AtomicPtr<T>; 16],
+    shards: [UnsafeCell<*mut T>; 16],
 }
 
 impl<T> AppendOnlyStore<T> {
@@ -25,26 +28,28 @@ impl<T> AppendOnlyStore<T> {
         };
         
         let shards = [
-            AtomicPtr::new(first_slice),
-            AtomicPtr::new(std::ptr::null_mut()),
-            AtomicPtr::new(std::ptr::null_mut()),
-            AtomicPtr::new(std::ptr::null_mut()),
-            AtomicPtr::new(std::ptr::null_mut()),
-            AtomicPtr::new(std::ptr::null_mut()),
-            AtomicPtr::new(std::ptr::null_mut()),
-            AtomicPtr::new(std::ptr::null_mut()),
-            AtomicPtr::new(std::ptr::null_mut()),
-            AtomicPtr::new(std::ptr::null_mut()),
-            AtomicPtr::new(std::ptr::null_mut()),
-            AtomicPtr::new(std::ptr::null_mut()),
-            AtomicPtr::new(std::ptr::null_mut()),
-            AtomicPtr::new(std::ptr::null_mut()),
-            AtomicPtr::new(std::ptr::null_mut()),
-            AtomicPtr::new(std::ptr::null_mut()),
+            UnsafeCell::new(first_slice),
+            UnsafeCell::new(std::ptr::null_mut()),
+            UnsafeCell::new(std::ptr::null_mut()),
+            UnsafeCell::new(std::ptr::null_mut()),
+            UnsafeCell::new(std::ptr::null_mut()),
+            UnsafeCell::new(std::ptr::null_mut()),
+            UnsafeCell::new(std::ptr::null_mut()),
+            UnsafeCell::new(std::ptr::null_mut()),
+            UnsafeCell::new(std::ptr::null_mut()),
+            UnsafeCell::new(std::ptr::null_mut()),
+            UnsafeCell::new(std::ptr::null_mut()),
+            UnsafeCell::new(std::ptr::null_mut()),
+            UnsafeCell::new(std::ptr::null_mut()),
+            UnsafeCell::new(std::ptr::null_mut()),
+            UnsafeCell::new(std::ptr::null_mut()),
+            UnsafeCell::new(std::ptr::null_mut()),
         ];
         
         AppendOnlyStore {
-            len: AtomicUsize::new(0),
+            claimed: AtomicUsize::new(0),
+            writes: AtomicUsize::new(0),
+            shards_allocated: AtomicUsize::new(0),
             max_capacity,
             shards,
             base_size,
@@ -52,110 +57,81 @@ impl<T> AppendOnlyStore<T> {
     }
     
     pub fn push(&self, item: T) -> usize {
-        loop {
-            let len = self.len.load(Ordering::Relaxed);
+        // 1. claim a new position. this may be in unallocated space.
+        let claimed = self.claimed.fetch_add(1, Ordering::Relaxed);
+        let item_ptr = {
             // if we are at the boundary of a slice, attempt to allocate
             // and swap.
-            let shard_info = shard_info(len, self.base_size);
-            if len != 0 && shard_info.is_start() {
-                if !self.shards[shard_info.shard_index].load(Ordering::Relaxed).is_null() {
-                    // another thread allocated successfully.
-                    // spin until len is bumped by that thread.
-                    continue
-                }
-                
+            let shard_info = shard_info(claimed, self.base_size);
+
+            // The first thread at a claim position is responsible for allocating the buffer.
+            // 2. allocate if necessary.
+            if claimed != 0 && shard_info.is_start() {
                 let layout = Layout::array::<T>(self.base_size << shard_info.shard_index).unwrap();
                 // SAFETY: allocated with the correct layout.
-                let slice_ptr = unsafe { std::alloc::alloc(layout) as *mut T };
-                
-                let compare_exchange_result = self.shards[shard_info.shard_index].compare_exchange(
-                    std::ptr::null_mut(),
-                    slice_ptr,
-                    Ordering::AcqRel,
-                    Ordering::Relaxed,
-                );
-                
-                if compare_exchange_result.is_err() {
-                    // deallocate the array
-                    // SAFETY: just allocated, was not written anywhere.
-                    unsafe { std::alloc::dealloc(slice_ptr as *mut u8, layout) }
-                    
-                    continue
-                }
-
-                // TODO is this needed? it's meant to ensure `get` reads accurately.
-                std::sync::atomic::fence(Ordering::Release); 
-                
-                // SAFETY: all threads only increment len at this size when
-                // they successfully allocated.
-                //
-                // Acquire prevents reordering with the subsequent write.
-                // Release prevents reordering with the previous compare-exchange
-                //
-                // UNWRAP: we already observed "len" on this thread and no other thread
-                // will win the shard compare exchange to increment.
-                self.len.compare_exchange(
-                    len,
-                    len + 1,
-                    Ordering::AcqRel,
-                    Ordering::Relaxed,
-                ).unwrap();
-                
+                let shard_ptr = unsafe { std::alloc::alloc(layout) as *mut T };
+                // SAFETY: `claimed` is atomic and only this value writes to this shard.
                 unsafe {
-                    // SAFETY: just claimed ownership of the item with
-                    // acquire semantics to prevent reordering.
-                    std::ptr::write(slice_ptr, item);
+                    *self.shards[shard_info.shard_index].get() = shard_ptr;
                 }
-                
-                return len;
-            } else {
-                // TODO is this needed?
-                // It's meant to ensure `get` reads accurately.
-                std::sync::atomic::fence(Ordering::Release); 
 
-                // SAFETY: Acquire prevents pointer write being reordered.
-                let compare_exchange_result = self.len.compare_exchange(
-                    len,
-                    len + 1,
-                    Ordering::Acquire,
-                    Ordering::Relaxed,
-                );
-                
-                if compare_exchange_result.is_ok() {
-                    let shard_ptr = self.shards[shard_info.shard_index].load(Ordering::Relaxed);
-                    assert!(!shard_ptr.is_null());
-                    
-                    // SAFETY: just claimed ownership of the item with Acquire
-                    // semantics to prevent reordering.
-                    unsafe {
-                        let item_ptr = shard_ptr.offset(shard_info.sub_index as isize);
-                        std::ptr::write(item_ptr, item);
+                loop {
+                    // SAFETY: release ordering prevents reordering with the write to self.shards.
+                    if self.shards_allocated.compare_exchange(
+                        shard_info.shard_index - 1,
+                        shard_info.shard_index,
+                        Ordering::Release,
+                        Ordering::Relaxed,
+                    ).is_ok() {
+                        break
                     }
-                    
-                    return len;
                 }
-            }
-        }
-    }
 
-    pub fn get(&self, index: usize) -> &T {
-        let len = self.len.load(Ordering::Relaxed);
+                shard_ptr
+            } else {
+                // spin until allocation has completed.
+                // SAFETY: Acquire ordering prevents reordering and pairs with the release, so the write to
+                //         self.shards[shard_index] is seen.
+                while shard_info.shard_index != 0 && self.shards_allocated.load(Ordering::Acquire) < shard_info.shard_index {}
 
-        // TODO: is this needed? supposed to ensure read after push is accurate.
-        std::sync::atomic::fence(Ordering::Acquire);
-
-        assert!(index < len, "index {} out of bounds", {index});
-        let shard_info = shard_info(index, self.base_size);
-
-        let shard_ptr = loop {
-            let shard_ptr = self.shards[shard_info.shard_index].load(Ordering::Relaxed);
-            if !shard_ptr.is_null() {
-                break shard_ptr
+                // SAFETY: shard buffer is guaranteed to be allocated at this point and claims
+                //         are unique.
+                unsafe {
+                    (*self.shards[shard_info.shard_index].get()).offset(shard_info.sub_index as isize)
+                }
             }
         };
 
+        // 3. write to the position.
+        // SAFETY: buffer is guaranteed to be allocated above and writes cannot be reordered above.
         unsafe {
-            // SAFETY: shard is allocated and sub index calculation is correct.
+            std::ptr::write(item_ptr, item);
+        }
+
+        // SAFETY: propagate writes to reader threads.
+        self.writes.fetch_add(1, Ordering::Release);
+
+        claimed
+    }
+
+    /// Get an item with the given index.
+    ///
+    /// # Safety
+    ///
+    /// This may only be called with an index which was previously returned by `push` on the same
+    /// instance of the struct. Anything else may lead to reading uninitialized or partially-written
+    /// memory.
+    pub unsafe fn get(&self, index: usize) -> &T {
+        self.writes.fetch_add(1, Ordering::Acquire);
+
+        let shard_info = shard_info(index, self.base_size);
+
+        unsafe {
+            // SAFETY: Acquire load above pairs with the release of self.writes in `push`, 
+            //         which always follows writing to the shard pointer. And by the contract
+            //         of this function, `index` must have been returned from `push` _after_
+            //         that release. qed
+            let shard_ptr = *self.shards[shard_info.shard_index].get();
             let item_ptr = shard_ptr.offset(shard_info.sub_index as isize);
             &*item_ptr
         }
@@ -164,9 +140,12 @@ impl<T> AppendOnlyStore<T> {
 
 impl<T> Drop for AppendOnlyStore<T> {
     fn drop(&mut self) {
-        std::sync::atomic::fence(Ordering::Acquire);
-        let len = self.len.load(Ordering::Acquire);
-        let shard_info = shard_info(len, self.base_size);
+        // SAFETY: this ensures all writes from other threads have propagated.
+        //         we have mutable access, therefore there are no ongoing writes.
+        //         therefore there are no gaps in our arrays.
+        let _writes = self.writes.load(Ordering::Acquire);
+        let claimed = self.claimed.load(Ordering::Relaxed);
+        let shard_info = shard_info(claimed, self.base_size);
         
         let drop_and_deallocate_nonempty = |ptr: *mut T, len, size| unsafe {
             {
@@ -187,18 +166,27 @@ impl<T> Drop for AppendOnlyStore<T> {
         // drop all the data in all of the shards.
         for full_shard in 0..shard_info.shard_index.saturating_sub(1) {
             let shard_size = (1 << full_shard) * self.base_size;
-            let shard_ptr = self.shards[full_shard].load(Ordering::Relaxed);
+
+            // SAFETY: protected by synchronization with self.writes and mutable
+            // access to self.
+            let shard_ptr = unsafe { *self.shards[full_shard].get() };
             drop_and_deallocate_nonempty(shard_ptr, shard_size, shard_size);
         }
         
         // SAFETY: sub_index of zero means unallocated and unpopulated.
         if shard_info.sub_index != 0 {
             let shard_size = (1 << shard_info.shard_index) * self.base_size;
-            let shard_ptr = self.shards[shard_info.shard_index].load(Ordering::Relaxed);
+            let shard_ptr = unsafe { *self.shards[shard_info.shard_index].get() };
             drop_and_deallocate_nonempty(shard_ptr, shard_size, shard_info.sub_index);
         }
     }
 } 
+
+// SAFETY: values may be read from any thread and dropped in (and therefore sent to) any thread.
+unsafe impl<T: Send + Sync> Send for AppendOnlyStore<T> {}
+
+// SAFETY: values may be read from any thread.
+unsafe impl<T: Sync> Sync for AppendOnlyStore<T> {}
 
 #[derive(Debug, PartialEq)]
 struct ShardInfo {
