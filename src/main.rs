@@ -83,38 +83,38 @@ fn main() {
 
         println!("append_only mixed: {}us", t.elapsed().as_micros());
     }
-    // {
-    //     let t = std::time::Instant::now();
-    //     let vec = Arc::new(Mutex::new(Vec::with_capacity(10_000)));
-    //     let mut threads = Vec::with_capacity(N_THREADS);
+    {
+        let t = std::time::Instant::now();
+        let vec = Arc::new(Mutex::new(Vec::with_capacity(10_000)));
+        let mut threads = Vec::with_capacity(N_THREADS);
 
-    //     for _ in 0..N_THREADS {
-    //         let vec = vec.clone();
-    //         threads.push(std::thread::spawn(move || mutex_vec_mixed(vec)));
-    //     }
+        for _ in 0..N_THREADS {
+            let vec = vec.clone();
+            threads.push(std::thread::spawn(move || mutex_vec_mixed(vec)));
+        }
 
-    //     for thread in threads {
-    //         thread.join().unwrap();
-    //     }
+        for thread in threads {
+            thread.join().unwrap();
+        }
 
-    //     println!("mutex vec mixed: {}us", t.elapsed().as_micros());
-    // }
-    // {
-    //     let t = std::time::Instant::now();
-    //     let vec = Arc::new(RwLock::new(Vec::with_capacity(10_000)));
-    //     let mut threads = Vec::with_capacity(N_THREADS);
+        println!("mutex vec mixed: {}us", t.elapsed().as_micros());
+    }
+    {
+        let t = std::time::Instant::now();
+        let vec = Arc::new(RwLock::new(Vec::with_capacity(10_000)));
+        let mut threads = Vec::with_capacity(N_THREADS);
 
-    //     for _ in 0..N_THREADS {
-    //         let vec = vec.clone();
-    //         threads.push(std::thread::spawn(move || rwlock_vec_mixed(vec)));
-    //     }
+        for _ in 0..N_THREADS {
+            let vec = vec.clone();
+            threads.push(std::thread::spawn(move || rwlock_vec_mixed(vec)));
+        }
 
-    //     for thread in threads {
-    //         thread.join().unwrap();
-    //     }
+        for thread in threads {
+            thread.join().unwrap();
+        }
 
-    //     println!("rwlock vec mixed: {}us", t.elapsed().as_micros());
-    // }
+        println!("rwlock vec mixed: {}us", t.elapsed().as_micros());
+    }
     {
         let t = std::time::Instant::now();
         let map = Arc::new(DashMap::with_capacity(10_000));
