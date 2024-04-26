@@ -1,6 +1,6 @@
 use std::alloc::Layout;
 use std::cell::UnsafeCell;
-use std::sync::atomic::{self, AtomicPtr, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 pub struct AppendOnlyStore<T> {
     claimed: AtomicUsize,
@@ -8,7 +8,7 @@ pub struct AppendOnlyStore<T> {
     shards_allocated: AtomicUsize,
     max_capacity: usize,
     base_size: usize,
-    shards: [UnsafeCell<*mut T>; 16],
+    shards: [UnsafeCell<*mut UnsafeCell<T>>; 16],
 }
 
 impl<T> AppendOnlyStore<T> {
@@ -21,10 +21,10 @@ impl<T> AppendOnlyStore<T> {
             .expect("max capacity overflow");
 
         let first_slice = {
-            let layout = Layout::array::<T>(base_size).unwrap();
+            let layout = Layout::array::<UnsafeCell<T>>(base_size).unwrap();
 
             // SAFETY: allocated with correct layout.
-            unsafe { std::alloc::alloc(layout) as *mut T }
+            unsafe { std::alloc::alloc(layout) as *mut UnsafeCell<T> }
         };
 
         let shards = [
@@ -59,7 +59,7 @@ impl<T> AppendOnlyStore<T> {
     pub fn push(&self, item: T) -> usize {
         // 1. claim a new position. this may be in unallocated space.
         let claimed = self.claimed.fetch_add(1, Ordering::Relaxed);
-        let item_ptr = {
+        let item_ptr: *mut UnsafeCell<T> = {
             // if we are at the boundary of a slice, attempt to allocate
             // and swap.
             let shard_info = shard_info(claimed, self.base_size);
@@ -67,9 +67,11 @@ impl<T> AppendOnlyStore<T> {
             // The first thread at a claim position is responsible for allocating the buffer.
             // 2. allocate if necessary.
             if claimed != 0 && shard_info.is_start() {
-                let layout = Layout::array::<T>(self.base_size << shard_info.shard_index).unwrap();
+                let layout =
+                    Layout::array::<UnsafeCell<T>>(self.base_size << shard_info.shard_index)
+                        .unwrap();
                 // SAFETY: allocated with the correct layout.
-                let shard_ptr = unsafe { std::alloc::alloc(layout) as *mut T };
+                let shard_ptr = unsafe { std::alloc::alloc(layout) as *mut UnsafeCell<T> };
                 // SAFETY: `claimed` is atomic and only this value writes to this shard.
                 unsafe {
                     *self.shards[shard_info.shard_index].get() = shard_ptr;
@@ -113,7 +115,7 @@ impl<T> AppendOnlyStore<T> {
         // 3. write to the position.
         // SAFETY: buffer is guaranteed to be allocated above and writes cannot be reordered above.
         unsafe {
-            std::ptr::write(item_ptr, item);
+            std::ptr::write(item_ptr, UnsafeCell::new(item));
         }
 
         // SAFETY: propagate writes to reader threads.
@@ -140,8 +142,8 @@ impl<T> AppendOnlyStore<T> {
             //         of this function, `index` must have been returned from `push` _after_
             //         that release. qed
             let shard_ptr = *self.shards[shard_info.shard_index].get();
-            let item_ptr = shard_ptr.offset(shard_info.sub_index as isize);
-            &*item_ptr
+            let item_ptr: *mut UnsafeCell<T> = shard_ptr.offset(shard_info.sub_index as isize);
+            &*(*item_ptr).get()
         }
     }
 }
@@ -155,18 +157,18 @@ impl<T> Drop for AppendOnlyStore<T> {
         let claimed = self.claimed.load(Ordering::Relaxed);
         let shard_info = shard_info(claimed, self.base_size);
 
-        let drop_and_deallocate_nonempty = |ptr: *mut T, len, size| unsafe {
+        let drop_and_deallocate_nonempty = |ptr: *mut UnsafeCell<T>, len, size| unsafe {
             {
                 // SAFETY: len is only ever incremented immediately prior to
                 // an unconditional write to that position.
                 // we have mutable access, therefore all writes have concluded
                 let slice = std::slice::from_raw_parts_mut(ptr, len);
-                std::ptr::drop_in_place(slice as *mut [T]);
+                std::ptr::drop_in_place(slice as *mut [UnsafeCell<T>]);
             }
 
             // SAFETY: we only increment len after allocating and writing the
             // array pointer.
-            let layout = std::alloc::Layout::array::<T>(size).unwrap();
+            let layout = std::alloc::Layout::array::<UnsafeCell<T>>(size).unwrap();
             std::alloc::dealloc(ptr as *mut u8, layout);
         };
 
