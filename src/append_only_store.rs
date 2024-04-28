@@ -154,6 +154,8 @@ impl<T> AppendOnlyStore<T> {
         }
 
         // SAFETY: propagate writes to reader threads.
+        // TODO: this is actually not safe, because the reader threads have to read the
+        // specific value we wrote.
         self.writes.fetch_add(1, Ordering::Release);
 
         claimed
@@ -167,6 +169,29 @@ impl<T> AppendOnlyStore<T> {
     /// instance of the struct. Anything else may lead to reading uninitialized or partially-written
     /// memory.
     pub unsafe fn get(&self, index: usize) -> &T {
+        // TODO: this is actually not safe, because the reader threads have to read the
+        // specific value we wrote for writes to propagate.
+        //
+        // I would like to solve this by returning an `Index` type of some kind, which is just a
+        // `usize`, but which can be sent between threads by using CAS operations. So you return
+        // an `Index` here, which is Copy but `!Send`. Reading from the same thread doesn't require
+        // any additional synchronization.
+        //
+        // Then to synchronize between threads, you can use an `IndexCell` that you can store an
+        // `Index` into with `Release` semantics and read an `Index` from with `Acquire` semantics.
+        // Also `compare_exchange`.
+        //
+        // We could also make a safe version of `get` that takes the index along with the shard
+        // pointer and panic when the pointers don't match. `IndexCell` would incur a bunch of
+        // overhead from including the pointer in each one (for the intended use case: tree node 
+        // storage), so `IndexCell` should use a `RawIndex`, which just wraps the index.
+        //
+        // Lastly, we could use some type-safety to do safe free-lists. The idea is that before you
+        // have ever copied or shared an index you can push it onto a FreeList. 
+        //
+        // Crucially, shared compare_exchanges are not considered copies in this model, so we can
+        // safely _attempt_ to place a node in a lock-free data structure, fail, and then reuse
+        // that memory safely.
         self.writes.fetch_add(1, Ordering::Acquire);
 
         let shard_info = shard_info(index, self.base_size);
